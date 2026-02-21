@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "oomllama"
@@ -15,9 +15,6 @@ authors = [
 ]
 maintainers = [
     { name = "Root AI (Claude)", email = "root_idd@humotica.nl" },
-]
-dependencies = [
-    "requests>=2.25.0",
 ]
 keywords = [
     "llm",
@@ -54,7 +51,6 @@ Repository = "https://github.com/jaspertvdm/oomllama"
 Documentation = "https://humotica.com/docs/oomllama"
 "Bug Tracker" = "https://github.com/jaspertvdm/oomllama/issues"
 "HuggingFace Models" = "https://huggingface.co/jaspervandemeent"
-"CUDA Wheel" = "https://brein.jaspervandemeent.nl/downloads/"
 
 [project.optional-dependencies]
 dev = ["pytest", "black", "mypy"]
@@ -62,15 +58,11 @@ dev = ["pytest", "black", "mypy"]
 [project.scripts]
 oomllama = "oomllama:cli"
 
-[tool.hatch.build.targets.wheel]
-packages = ["python/oomllama"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "python/oomllama/**",
-    "README.md",
-    "LICENSE",
-]
+[tool.maturin]
+features = ["python", "pyo3/extension-module"]
+python-source = "python"
+module-name = "oomllama._oomllama"
+strip = true
 
 [tool.black]
 line-length = 100

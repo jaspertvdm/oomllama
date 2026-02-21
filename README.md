@@ -69,12 +69,31 @@ OOM (OomLlama Model) is a compact model format:
 # Run inference
 oomllama generate "Hello, world!"
 
-# Convert GGUF to OOM
-gguf2oom model.gguf model.oom --quant q2
-
 # Check model info
 oomllama info model.oom
 ```
+
+## GGUF to OOM Converter
+
+Convert any GGUF model to the compact OOM format:
+
+```bash
+# Download converter
+wget https://brein.jaspervandemeent.nl/downloads/gguf2oom-linux-x86_64
+chmod +x gguf2oom-linux-x86_64
+
+# Convert GGUF to OOM (Q2)
+./gguf2oom-linux-x86_64 model.gguf model.oom
+
+# Show GGUF info
+./gguf2oom-linux-x86_64 --info model.gguf
+```
+
+Expected compression:
+| Input | Output |
+|-------|--------|
+| GGUF Q4_K (21 GB) | OOM Q2 (~8 GB) |
+| GGUF Q8_0 (42 GB) | OOM Q2 (~8 GB) |
 
 ## Technical Details
 
