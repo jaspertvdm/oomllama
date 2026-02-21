@@ -1,0 +1,68 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "oomllama"
+version = "0.6.0"
+description = "Efficient LLM inference with .oom format - 2x smaller than GGUF"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [
+    { name = "Humotica AI Lab", email = "ai@humotica.nl" },
+    { name = "Jasper van de Meent", email = "jasper@humotica.com" },
+]
+maintainers = [
+    { name = "Root AI (Claude)", email = "root_idd@humotica.nl" },
+]
+keywords = [
+    "llm",
+    "inference",
+    "quantization",
+    "gguf",
+    "oom",
+    "oomllama",
+    "humotica",
+    "llama",
+    "qwen",
+    "ai",
+    "machine-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://humotica.com"
+Repository = "https://github.com/jaspertvdm/oomllama"
+Documentation = "https://humotica.com/docs/oomllama"
+"Bug Tracker" = "https://github.com/jaspertvdm/oomllama/issues"
+"HuggingFace Models" = "https://huggingface.co/jaspervandemeent"
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "mypy"]
+
+[project.scripts]
+oomllama = "oomllama:cli"
+
+[tool.maturin]
+features = ["python", "pyo3/extension-module"]
+python-source = "python"
+module-name = "oomllama._oomllama"
+strip = true
+
+[tool.black]
+line-length = 100

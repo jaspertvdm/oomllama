@@ -1,0 +1,11 @@
+target/
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+.venv/
+*.oom
+downloads/
+data/
+*.lock
