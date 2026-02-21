@@ -1,0 +1,43 @@
+# OomLlama API Server
+# Usage: docker run -p 8000:8000 -v ~/.cache/oomllama:/models jtmeent/oomllama:api
+
+FROM python:3.11-slim
+
+LABEL maintainer="Humotica AI Lab <ai@humotica.nl>"
+LABEL description="OomLlama API Server - REST API for .oom format inference"
+LABEL version="0.6.0"
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the Python package
+COPY python/oomllama /app/oomllama
+COPY pyproject.toml /app/
+COPY README.md /app/
+
+# Install as package + API deps
+RUN pip install --no-cache-dir /app fastapi uvicorn
+
+# Copy server
+COPY docker/server.py /app/server.py
+
+# Create models directory
+RUN mkdir -p /models
+
+# Environment
+ENV OOMLLAMA_CACHE=/models
+ENV MODEL_NAME=humotica-32b
+ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
