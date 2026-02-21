@@ -13,9 +13,36 @@ readme = "README.md"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Web framework
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Cryptography
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+hex = "0.4"
+
+# UUID
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# File watching
+notify = "6.1.1"
+
+# Database
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+
+# Concurrency
+parking_lot = "0.12.5"
+dashmap = "6.1.0"
 
 # Memory mapping for lazy loading
 memmap2 = "0.9"
@@ -33,12 +60,22 @@ candle-transformers = { version = "0.9.1", features = ["cuda"] }
 hf-hub = "0.4.3"
 tokenizers = "0.22.2"
 
-# CLI
+# CLI & TUI
 colored = "2.0"
 shellexpand = "3.1"
 regex = "1.12.2"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
+ratatui = { version = "0.30.0", features = ["all-widgets", "crossterm"] }
+crossterm = "0.29.0"
+
+# HTTP client
+reqwest = { version = "0.13.1", features = ["json"] }
+
+# Utils
+ctrlc = "3.4"
+tempfile = "3.14"
+walkdir = "2.5.0"
 
 # Python bindings (optional)
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
