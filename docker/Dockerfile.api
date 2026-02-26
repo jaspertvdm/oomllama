@@ -5,7 +5,7 @@ FROM python:3.11-slim
 
 LABEL maintainer="Humotica AI Lab <ai@humotica.nl>"
 LABEL description="OomLlama API Server - REST API for .oom format inference"
-LABEL version="0.6.0"
+LABEL version="0.8.0"
 
 WORKDIR /app
 

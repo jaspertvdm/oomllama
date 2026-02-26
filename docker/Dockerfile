@@ -7,8 +7,8 @@
 FROM python:3.11-slim
 
 LABEL maintainer="Humotica AI Lab <ai@humotica.nl>"
-LABEL description="OomLlama - Efficient LLM inference with .oom format (2x smaller than GGUF)"
-LABEL version="0.6.0"
+LABEL description="OomLlama - Efficient LLM inference engine with .oom format"
+LABEL version="0.8.0"
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY python/oomllama /app/oomllama
 
 # Install dependencies
-RUN pip install --no-cache-dir requests
+RUN pip install --no-cache-dir requests numpy safetensors torch --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Create models directory
 RUN mkdir -p /root/.cache/oomllama

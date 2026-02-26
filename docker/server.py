@@ -29,7 +29,7 @@ GPU_ID = os.environ.get("GPU_ID")
 app = FastAPI(
     title="OomLlama API",
     description="Efficient LLM inference with .oom format - 2x smaller than GGUF",
-    version="0.6.0",
+    version="0.8.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -89,7 +89,7 @@ async def health():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "version": version() if callable(version) else "0.6.0",
+        "version": version() if callable(version) else "0.8.0",
         "format": "oom",
         "model": MODEL_NAME
     }
@@ -111,13 +111,14 @@ async def info():
     return {
         "name": MODEL_NAME,
         "format": "oom",
-        "quantization": "Q2",
-        "description": "2-bit quantized weights with per-block scale/min",
+        "quantization": "Q2/Q4/Q8",
+        "description": "Quantized weights with per-block scale/min (256 block size)",
         "features": [
-            "Q2 Quantization (2-bit weights)",
+            "Q2/Q4/Q8 Quantization with F32 norms",
+            "SafeTensors + GGUF converters",
             "Lazy Layer Loading",
             "Interleaved RoPE (Qwen support)",
-            "2x smaller than GGUF Q4"
+            "GPU acceleration via CUDA/Candle"
         ]
     }
 
@@ -161,7 +162,7 @@ async def root():
     """Welcome endpoint."""
     return {
         "service": "OomLlama API",
-        "version": "0.6.0",
+        "version": "0.8.0",
         "description": "Efficient LLM inference with .oom format",
         "format": {
             "name": "OOM (OomLlama Model)",
