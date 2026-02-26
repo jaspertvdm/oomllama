@@ -25,7 +25,6 @@ use crate::tibet::TibetFactory;
 use crate::betti::{BettiManager, AllocationRequest, ResourceType, Humotica};
 use crate::quant::OomLoader;
 use crate::oomllama_turbo::{TurboEngine, TurboConfig, PinStrategy, FlashAttentionConfig, flash_attention_forward};
-use crate::oom_inference::Sampler;
 
 // Re-using the config struct
 #[derive(Deserialize, Debug, Clone)]
@@ -112,6 +111,8 @@ impl GhostLinear {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor, Box<dyn std::error::Error + Send + Sync>> {
         let w = self.weight.materialize()?;
+        // GGUF stores weights as [out_features, in_features] (same as PyTorch).
+        // So we need x @ w.T to compute: output[i,j] = sum_k(x[i,k] * w[j,k])
         let w_t = w.t()?;
 
         // Handle both 2D [seq, hidden] and 3D [batch, seq, hidden] input
@@ -119,13 +120,65 @@ impl GhostLinear {
         if x_dims.len() == 3 {
             // 3D: flatten -> matmul -> reshape
             let (batch, seq, hidden) = x.dims3()?;
-            let out_dim = w_t.dim(1)?;
+            let out_dim = w_t.dim(1)?;  // w_t is [in_features, out_features]
             let x_flat = x.reshape((batch * seq, hidden))?;
             let res = x_flat.matmul(&w_t)?;
             Ok(res.reshape((batch, seq, out_dim))?)
         } else {
             // 2D: direct matmul
             Ok(x.matmul(&w_t)?)
+        }
+    }
+}
+
+/// Linear layer with bias support (for Qwen attention projections)
+#[allow(dead_code)]
+struct GhostLinearWithBias {
+    weight: GhostLayer,
+    bias: Option<GhostLayer>,
+}
+
+impl GhostLinearWithBias {
+    fn new(weight_name: &str, bias_name: &str, device: Device, loader: Arc<OomLoader>, config: LlamaConfig) -> Self {
+        // Check if bias exists in the model
+        let has_bias = loader.tensors.contains_key(bias_name);
+
+        let bias = if has_bias {
+            Some(GhostLayer::new(bias_name.to_string(), device.clone(), loader.clone(), config.clone()))
+        } else {
+            None
+        };
+        Self {
+            weight: GhostLayer::new(weight_name.to_string(), device, loader, config),
+            bias,
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor, Box<dyn std::error::Error + Send + Sync>> {
+        let w = self.weight.materialize()?;
+        // GGUF stores weights as [out_features, in_features], so we need x @ w.T
+        let w_t = w.t()?;
+
+        // Handle both 2D [seq, hidden] and 3D [batch, seq, hidden] input
+        let x_dims = x.dims();
+        let result = if x_dims.len() == 3 {
+            // 3D: flatten -> matmul -> reshape
+            let (batch, seq, hidden) = x.dims3()?;
+            let out_dim = w_t.dim(1)?;  // w_t is [in_features, out_features]
+            let x_flat = x.reshape((batch * seq, hidden))?;
+            let res = x_flat.matmul(&w_t)?;
+            res.reshape((batch, seq, out_dim))?
+        } else {
+            // 2D: direct matmul
+            x.matmul(&w_t)?
+        };
+
+        // Add bias if present
+        if let Some(ref bias_layer) = self.bias {
+            let bias = bias_layer.materialize()?;
+            Ok(result.broadcast_add(&bias)?)
+        } else {
+            Ok(result)
         }
     }
 }
@@ -146,6 +199,7 @@ impl GhostRMSNorm {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor, Box<dyn std::error::Error + Send + Sync>> {
         let w = self.weight.materialize()?;
+
         // RMSNorm: x / sqrt(mean(x^2) + eps) * w
         let x_dtype = x.dtype();
         let x_f32 = x.to_dtype(DType::F32)?;
@@ -174,21 +228,26 @@ impl GhostMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor, Box<dyn std::error::Error + Send + Sync>> {
+
         let gate = self.gate_proj.forward(x)?;
+
         let up = self.up_proj.forward(x)?;
+
         // Simple approximation of SiLU: x * sigmoid(x)
         let activated_gate = (gate.clone() * candle_nn::ops::sigmoid(&gate)?)?;
         let intermediate = (activated_gate * up)?;
-        self.down_proj.forward(&intermediate)
+
+        let result = self.down_proj.forward(&intermediate)?;
+        Ok(result)
     }
 }
 
 #[allow(dead_code)]
 struct GhostAttention {
-    q_proj: GhostLinear,
-    k_proj: GhostLinear,
-    v_proj: GhostLinear,
-    o_proj: GhostLinear,
+    q_proj: GhostLinearWithBias,  // Qwen uses bias in attention projections
+    k_proj: GhostLinearWithBias,
+    v_proj: GhostLinearWithBias,
+    o_proj: GhostLinear,  // Output projection has no bias
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -200,9 +259,9 @@ struct GhostAttention {
 impl GhostAttention {
     fn new(prefix: &str, device: Device, loader: Arc<OomLoader>, config: LlamaConfig, layer_idx: usize) -> Self {
         let head_dim = config.hidden_size / config.num_attention_heads;
-        let max_seq_len = 2048; // TinyLlama max context
+        let max_seq_len = 4096; // Max context length
 
-        // Compute RoPE frequencies
+        // Compute RoPE frequencies using model's rope_theta
         let (rope_sin, rope_cos) = crate::oomllama_turbo::compute_rope_freqs(
             head_dim,
             max_seq_len,
@@ -211,9 +270,22 @@ impl GhostAttention {
         ).expect("Failed to compute RoPE frequencies");
 
         Self {
-            q_proj: GhostLinear::new(&format!("{}.q_proj.weight", prefix), device.clone(), loader.clone(), config.clone()),
-            k_proj: GhostLinear::new(&format!("{}.k_proj.weight", prefix), device.clone(), loader.clone(), config.clone()),
-            v_proj: GhostLinear::new(&format!("{}.v_proj.weight", prefix), device.clone(), loader.clone(), config.clone()),
+            // Qwen uses biases for Q, K, V projections
+            q_proj: GhostLinearWithBias::new(
+                &format!("{}.q_proj.weight", prefix),
+                &format!("{}.q_proj.bias", prefix),
+                device.clone(), loader.clone(), config.clone()
+            ),
+            k_proj: GhostLinearWithBias::new(
+                &format!("{}.k_proj.weight", prefix),
+                &format!("{}.k_proj.bias", prefix),
+                device.clone(), loader.clone(), config.clone()
+            ),
+            v_proj: GhostLinearWithBias::new(
+                &format!("{}.v_proj.weight", prefix),
+                &format!("{}.v_proj.bias", prefix),
+                device.clone(), loader.clone(), config.clone()
+            ),
             o_proj: GhostLinear::new(&format!("{}.o_proj.weight", prefix), device, loader, config.clone()),
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads.unwrap_or(config.num_attention_heads),
@@ -224,66 +296,35 @@ impl GhostAttention {
         }
     }
 
-    /// Forward with TurboEngine KV-cache support + Layer Pinning
+    /// Forward with TurboEngine KV-cache support
     fn forward_turbo(
         &self,
         x: &Tensor,
         turbo: &mut TurboEngine,
     ) -> Result<Tensor, Box<dyn std::error::Error + Send + Sync>> {
-        // Check for pinned weights first (VRAM cache)
-        let wq_t = if let Some(pinned) = turbo.get_pinned(self.layer_idx, "q_proj") {
-            pinned.clone()
-        } else {
-            let wq = self.q_proj.weight.materialize()?;
-            let wq_t = wq.t()?.contiguous()?;
-            // Pin if this layer should be pinned
-            if turbo.should_pin_layer(self.layer_idx) {
-                turbo.pin_tensor(self.layer_idx, "q_proj", wq_t.clone());
-            }
-            wq_t
-        };
+        // Materialize weight tensors (already stored as [in, out] from GGUF)
+        let wq = self.q_proj.weight.materialize()?;
+        let wk = self.k_proj.weight.materialize()?;
+        let wv = self.v_proj.weight.materialize()?;
+        let wo = self.o_proj.weight.materialize()?;
+        // No transpose needed - GGUF stores weights as [in, out] which is correct for x @ W
 
-        let wk_t = if let Some(pinned) = turbo.get_pinned(self.layer_idx, "k_proj") {
-            pinned.clone()
-        } else {
-            let wk = self.k_proj.weight.materialize()?;
-            let wk_t = wk.t()?.contiguous()?;
-            if turbo.should_pin_layer(self.layer_idx) {
-                turbo.pin_tensor(self.layer_idx, "k_proj", wk_t.clone());
-            }
-            wk_t
-        };
-
-        let wv_t = if let Some(pinned) = turbo.get_pinned(self.layer_idx, "v_proj") {
-            pinned.clone()
-        } else {
-            let wv = self.v_proj.weight.materialize()?;
-            let wv_t = wv.t()?.contiguous()?;
-            if turbo.should_pin_layer(self.layer_idx) {
-                turbo.pin_tensor(self.layer_idx, "v_proj", wv_t.clone());
-            }
-            wv_t
-        };
-
-        let wo_t = if let Some(pinned) = turbo.get_pinned(self.layer_idx, "o_proj") {
-            pinned.clone()
-        } else {
-            let wo = self.o_proj.weight.materialize()?;
-            let wo_t = wo.t()?.contiguous()?;
-            if turbo.should_pin_layer(self.layer_idx) {
-                turbo.pin_tensor(self.layer_idx, "o_proj", wo_t.clone());
-            }
-            wo_t
-        };
+        // Extract biases if present (Qwen requires biases on Q/K/V projections)
+        let bq = self.q_proj.bias.as_ref().map(|b| b.materialize()).transpose()?;
+        let bk = self.k_proj.bias.as_ref().map(|b| b.materialize()).transpose()?;
+        let bv = self.v_proj.bias.as_ref().map(|b| b.materialize()).transpose()?;
 
         // Use TurboEngine's attention_forward with KV-cache
-        let out = turbo.attention_forward(
+        let out = turbo.attention_forward_with_bias(
             self.layer_idx,
             x,
-            &wq_t,
-            &wk_t,
-            &wv_t,
-            &wo_t,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
         )?;
 
         Ok(out)
@@ -306,10 +347,9 @@ impl GhostAttention {
         let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Apply RoPE positional encoding to Q and K
-        // GGUF stores Q/K weights in interleaved format, so we use interleaved RoPE
-        let q = crate::oomllama_turbo::apply_rope(&q, &self.rope_sin, &self.rope_cos, 0)?;
-        let k = crate::oomllama_turbo::apply_rope(&k, &self.rope_sin, &self.rope_cos, 0)?;
+        // Apply RoPE using pre-computed frequencies (NON-INTERLEAVED / LLaMA-style for Qwen)
+        let q = crate::oomllama_turbo::apply_rope_llama(&q, &self.rope_sin, &self.rope_cos, 0)?;
+        let k = crate::oomllama_turbo::apply_rope_llama(&k, &self.rope_sin, &self.rope_cos, 0)?;
 
         // Flash Attention
         let att_out = flash_attention_forward(&q, &k, &v, &FlashAttentionConfig::default())?;
@@ -319,9 +359,7 @@ impl GhostAttention {
             .reshape((batch, seq_len, self.num_heads * self.head_dim))?;
 
         // Output projection
-        let out = self.o_proj.forward(&att_out)?;
-
-        Ok(out)
+        self.o_proj.forward(&att_out)
     }
 }
 
@@ -347,11 +385,13 @@ impl GhostDecoderLayer {
 
     /// Forward with turbo mode (KV-cache + Flash Attention)
     fn forward_turbo(&self, x: &Tensor, turbo: &mut TurboEngine) -> Result<Tensor, Box<dyn std::error::Error + Send + Sync>> {
+
         let residual = x.clone();
         let x = self.input_layernorm.forward(x)?;
 
         // Turbo attention with KV-cache
         let x = self.self_attn.forward_turbo(&x, turbo)?;
+
         let x = (x + residual)?;
 
         let residual = x.clone();
@@ -389,18 +429,10 @@ impl GhostLayer {
         // 2. Infer shape from config (Hacky, but works for now)
         let shape = infer_shape(&self.name, &self.config);
 
-        // Debug: print first materialize
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static FIRST_PRINT: AtomicBool = AtomicBool::new(true);
-        if FIRST_PRINT.swap(false, Ordering::Relaxed) {
-            println!("🔧 First materialize: tensor={}, shape={:?}, target_device={:?}",
-                     &self.name, shape, self.device);
-        }
-
-        // 3. Create tensor on CPU first (from_vec always creates on CPU device internally)
+        // 3. Create on CPU first, then transfer to target device
         let cpu_tensor = Tensor::from_vec(data, shape, &Device::Cpu)?;
 
-        // 4. Move to target device (GPU if available)
+        // 4. Transfer to target device (GPU if available)
         let tensor = cpu_tensor.to_device(&self.device)?;
 
         Ok(tensor)
@@ -476,19 +508,27 @@ impl GhostLlamaModel {
         // 1. Embeddings
         let mut x = {
             let embed_w = self.embed_tokens.materialize()?;
-            embed_w.embedding(&tokens.flatten_all()?)?
+
+            // For turbo: tokens is just the new token(s), not the full sequence
+            let emb = embed_w.embedding(&tokens.flatten_all()?)?;
+
+            emb
         };
 
+        // Need to add batch dimension if missing [seq] -> [batch, seq, hidden]
         if x.dims().len() == 2 {
             x = x.unsqueeze(0)?;
         }
 
         // 2. Decoder Layers with Turbo
+
         for (i, layer) in self.layers.iter().enumerate() {
             if i % 10 == 0 {
-                println!("🚀 Turbo layer {}/{}...", i, self.layers.len());
+                let cached = turbo.seq_len();
+                println!("🚀 Turbo layer {}/{} (KV-cache: {} tokens)...", i, self.layers.len(), cached);
             }
 
+            // Dual GPU tensor transfer
             if dual_gpu {
                 let target_device = if i % 2 == 1 { &self.devices[1] } else { &self.devices[0] };
                 if x.device().location() != target_device.location() {
@@ -496,13 +536,16 @@ impl GhostLlamaModel {
                 }
             }
 
+            // Use turbo forward with KV-cache
             x = layer.forward_turbo(&x, turbo)?;
+
         }
 
         // 3. Final Norm
         if dual_gpu {
             x = x.to_device(&self.devices[0])?;
         }
+
         x = self.norm.forward(&x)?;
 
         // 4. LM Head
@@ -514,21 +557,21 @@ impl GhostLlamaModel {
         // Check if we have dual GPU
         let dual_gpu = self.devices.len() > 1 && self.devices[0].is_cuda() && self.devices[1].is_cuda();
 
-        // 1. Embeddings
+        // 1. Embeddings (Materialize -> Gather -> Evict) - Always on primary GPU
         let mut x = {
             let embed_w = self.embed_tokens.materialize()?;
-            let token_ids = tokens.flatten_all()?;
-            let embed_out = embed_w.embedding(&token_ids)?;
-            embed_out.unsqueeze(0)?
+            let emb = embed_w.embedding(&tokens.flatten_all()?)?;
+            // Add batch dimension: [seq, hidden] -> [1, seq, hidden]
+            emb.unsqueeze(0)?
         };
 
         // 2. Decoder Layers (The Ghost Loop)
         for (i, layer) in self.layers.iter().enumerate() {
             if i % 10 == 0 {
-                println!("👻 Ghost layer {}/{}...", i, self.layers.len());
+                println!("👻 Ghost processing layer {}/{}...", i, self.layers.len());
             }
 
-            // DUAL GPU: Transfer tensor to correct device
+            // DUAL GPU: Transfer tensor to correct device before processing layer
             if dual_gpu {
                 let target_device = if i % 2 == 1 { &self.devices[1] } else { &self.devices[0] };
                 if x.device().location() != target_device.location() {
@@ -536,26 +579,30 @@ impl GhostLlamaModel {
                 }
             }
 
-            // Attention block
             let residual = x.clone();
             x = layer.input_layernorm.forward(&x)?;
+
+            // --- GHOST ATTENTION with Flash Attention ---
             x = layer.self_attn.forward(&x)?;
+
             x = (x + residual)?;
 
-            // MLP block
+            // --- GHOST MLP ---
             let residual = x.clone();
             x = layer.post_attention_layernorm.forward(&x)?;
             x = layer.mlp.forward(&x)?;
             x = (x + residual)?;
+
         }
 
-        // 3. Final Norm
+        // 3. Final Norm - Transfer back to primary GPU
         if dual_gpu {
             x = x.to_device(&self.devices[0])?;
         }
+
         x = self.norm.forward(&x)?;
 
-        // 4. LM Head
+        // 4. LM Head (Final Ghost)
         self.lm_head.forward(&x)
     }
 }
@@ -586,9 +633,6 @@ pub struct GhostLlama {
     betti: Arc<BettiManager>,
     allocation_id: Option<Uuid>,
     name: String,
-
-    // 🎲 Token Sampler (temperature, top-p, top-k)
-    sampler: Sampler,
 }
 
 impl GhostLlama {
@@ -596,16 +640,36 @@ impl GhostLlama {
     /// - `gpu_index`: Primary GPU (None = CPU)
     /// - `secondary_gpu`: Optional second GPU for dual-GPU layer striping
     pub fn new(name: &str, gpu_index: Option<usize>, betti: Arc<BettiManager>, model_path: Option<&str>, tokenizer_path: Option<&str>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Dual GPU detection: try to find a secondary GPU for layer striping
+        // NEW: Also try to initialize secondary GPU for dual-GPU mode
+        // But ONLY if CUDA_VISIBLE_DEVICES allows multiple GPUs
         let secondary_gpu: Option<usize> = if gpu_index.is_some() {
-            // Try GPU 1 if primary is GPU 0, or GPU 0 if primary is something else
-            let secondary_idx = if gpu_index == Some(0) { 1 } else { 0 };
-            if Device::new_cuda(secondary_idx).is_ok() {
-                println!("🎮 Dual GPU mode: Primary GPU {}, Secondary GPU {} - RoPE on both!",
-                         gpu_index.unwrap(), secondary_idx);
-                Some(secondary_idx)
+            // Check CUDA_VISIBLE_DEVICES - if set to single GPU, don't try dual GPU
+            let visible_devices = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+            let allow_dual = match &visible_devices {
+                Some(val) => {
+                    // If only one device specified (e.g., "0"), disable dual GPU
+                    let device_count = val.split(',').filter(|s| !s.is_empty()).count();
+                    if device_count <= 1 {
+                        println!("📌 CUDA_VISIBLE_DEVICES={} - Single GPU mode", val);
+                        false
+                    } else {
+                        println!("📌 CUDA_VISIBLE_DEVICES={} - Multi-GPU available", val);
+                        true
+                    }
+                }
+                None => true, // No restriction, try dual GPU
+            };
+
+            if allow_dual {
+                // Try GPU 1 if primary is GPU 0, or GPU 0 if primary is something else
+                let secondary_idx = if gpu_index == Some(0) { 1 } else { 0 };
+                if Device::new_cuda(secondary_idx).is_ok() {
+                    println!("🎮 Secondary GPU {} detected - enabling dual GPU mode!", secondary_idx);
+                    Some(secondary_idx)
+                } else {
+                    None
+                }
             } else {
-                println!("🎮 Single GPU mode (no secondary GPU found)");
                 None
             }
         } else {
@@ -638,69 +702,42 @@ impl GhostLlama {
         let device = match gpu_index {
             Some(idx) => {
                 match Device::new_cuda(idx) {
-                    Ok(dev) => {
-                        println!("✅ CUDA device {} initialized successfully", idx);
-                        dev
+                    Ok(d) => {
+                        println!("✅ CUDA device {} initialized successfully!", idx);
+                        d
                     }
                     Err(e) => {
-                        println!("❌ CUDA device {} failed: {:?} - falling back to CPU", idx, e);
+                        println!("⚠️ CUDA device {} failed: {:?}, falling back to CPU", idx, e);
                         Device::Cpu
                     }
                 }
             }
             None => {
-                println!("⚠️ No GPU index specified, using CPU");
+                println!("ℹ️ No GPU index specified, using CPU");
                 Device::Cpu
             }
         };
 
-        let secondary_device = secondary_gpu.and_then(|idx| {
-            match Device::new_cuda(idx) {
-                Ok(dev) => {
-                    println!("✅ Secondary CUDA device {} initialized successfully", idx);
-                    Some(dev)
-                }
-                Err(e) => {
-                    println!("❌ Secondary CUDA device {} failed: {:?}", idx, e);
-                    None
-                }
-            }
-        });
+        let secondary_device = secondary_gpu.and_then(|idx| Device::new_cuda(idx).ok());
 
-        // Load Tokenizer - detect model type from path and load appropriate tokenizer
+        // Load Tokenizer - detect model type from path
         let tokenizer = if let Some(path) = tokenizer_path {
-            println!("📝 Loading tokenizer from: {}", path);
             Tokenizer::from_file(path).map_err(|e| e.to_string())?
-        } else if let Some(model_p) = model_path {
-            // Check for tokenizer in model directory first
-            let model_dir = std::path::Path::new(model_p).parent().unwrap_or(std::path::Path::new("."));
-            let local_tokenizer = model_dir.join("tokenizer.json");
-            if local_tokenizer.exists() {
-                println!("📝 Found tokenizer in model dir: {:?}", local_tokenizer);
-                Tokenizer::from_file(&local_tokenizer).map_err(|e| e.to_string())?
-            } else {
-                // Detect model type from path and load from HuggingFace
-                let api = Api::new()?;
-                let repo_name = if model_p.contains("qwen") {
-                    println!("📝 Loading Qwen tokenizer from HuggingFace...");
-                    "Qwen/Qwen2.5-7B-Instruct"
-                } else if model_p.contains("llama") && (model_p.contains("70b") || model_p.contains("70B")) {
-                    println!("📝 Loading Llama 3.3 70B tokenizer from HuggingFace...");
-                    "meta-llama/Llama-3.3-70B-Instruct"
-                } else if model_p.contains("llama") {
-                    println!("📝 Loading Llama tokenizer from HuggingFace...");
-                    "meta-llama/Llama-3.2-1B-Instruct"
-                } else {
-                    println!("📝 No model detected, using TinyLlama tokenizer fallback");
-                    "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-                };
-                let repo = api.repo(Repo::new(repo_name.to_string(), RepoType::Model));
-                let filename = repo.get("tokenizer.json")?;
-                Tokenizer::from_file(filename).map_err(|e| e.to_string())?
-            }
         } else {
             let api = Api::new()?;
-            let repo = api.repo(Repo::new("TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(), RepoType::Model));
+            // Select tokenizer based on model name
+            let model_name = model_path.unwrap_or("");
+            let repo_name = if model_name.contains("qwen") || model_name.contains("humotica") {
+                println!("📝 Loading Qwen tokenizer...");
+                "Qwen/Qwen2.5-7B-Instruct"
+            } else if model_name.contains("llama3") || model_name.contains("llama-3") {
+                println!("📝 Loading Llama 3 tokenizer...");
+                "meta-llama/Llama-3.2-1B"
+            } else {
+                println!("📝 Loading TinyLlama tokenizer (default)...");
+                "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+            };
+            let repo = api.repo(Repo::new(repo_name.to_string(), RepoType::Model));
             let filename = repo.get("tokenizer.json")?;
             Tokenizer::from_file(filename).map_err(|e| e.to_string())?
         };
@@ -748,13 +785,51 @@ impl GhostLlama {
                     rope_scaling: None,
                     tie_word_embeddings: false,
                  }
-             } else if path.contains("qwen") && (path.contains("7b") || path.contains("7B")) {
+             } else if path.contains("0.5b") || path.contains("qwen2.5-0.5") {
+                 // Qwen 2.5 0.5B config
+                 println!("🦙 QWEN 0.5B DETECTED: Using Qwen 0.5B config (Hidden: 896, 24 layers, Vocab: 151936).");
+                 Config {
+                    hidden_size: 896,
+                    intermediate_size: 4864,
+                    vocab_size: 151936,
+                    num_hidden_layers: 24,
+                    num_attention_heads: 14,
+                    num_key_value_heads: 2,
+                    rms_norm_eps: 1e-6,
+                    rope_theta: 1000000.0,
+                    use_flash_attn: false,
+                    bos_token_id: Some(151643),
+                    eos_token_id: Some(LlamaEosToks::Single(151645)),
+                    max_position_embeddings: 32768,
+                    rope_scaling: None,
+                    tie_word_embeddings: false,
+                 }
+             } else if path.contains("3b") || path.contains("qwen2.5-3") {
+                 // Qwen 2.5 3B config
+                 println!("🦙 QWEN 3B DETECTED: Using Qwen 3B config (Hidden: 2048, 36 layers, Vocab: 151936).");
+                 Config {
+                    hidden_size: 2048,
+                    intermediate_size: 11008,
+                    vocab_size: 151936,
+                    num_hidden_layers: 36,
+                    num_attention_heads: 16,
+                    num_key_value_heads: 2,
+                    rms_norm_eps: 1e-6,
+                    rope_theta: 1000000.0,
+                    use_flash_attn: false,
+                    bos_token_id: Some(151643),
+                    eos_token_id: Some(LlamaEosToks::Single(151645)),
+                    max_position_embeddings: 32768,
+                    rope_scaling: None,
+                    tie_word_embeddings: false,
+                 }
+             } else if path.contains("7b") || path.contains("humotica-7") || path.contains("qwen2.5-7") {
                  // Qwen 2.5 7B config
-                 println!("🐇 QWEN 7B DETECTED: Using Qwen 7B config (Hidden: 3584, Vocab: 152064).");
+                 println!("🦙 QWEN 7B DETECTED: Using Qwen 7B config (Hidden: 3584, 28 layers, Vocab: 152064).");
                  Config {
                     hidden_size: 3584,
                     intermediate_size: 18944,
-                    vocab_size: 152064,
+                    vocab_size: 152064, // Qwen 2.5 vocab
                     num_hidden_layers: 28,
                     num_attention_heads: 28,
                     num_key_value_heads: 4,
@@ -763,45 +838,26 @@ impl GhostLlama {
                     use_flash_attn: false,
                     bos_token_id: Some(151643),
                     eos_token_id: Some(LlamaEosToks::Single(151645)),
-                    max_position_embeddings: 131072,
+                    max_position_embeddings: 32768,
                     rope_scaling: None,
                     tie_word_embeddings: false,
                  }
-             } else if path.contains("qwen") && (path.contains("32b") || path.contains("32B")) {
-                 // Qwen 2.5 32B config
-                 println!("🐘 QWEN 32B DETECTED: Using Qwen 32B config (Hidden: 5120, Vocab: 152064).");
-                 Config {
-                    hidden_size: 5120,
-                    intermediate_size: 27648,
-                    vocab_size: 152064,
-                    num_hidden_layers: 64,
-                    num_attention_heads: 40,
-                    num_key_value_heads: 8,
-                    rms_norm_eps: 1e-5,
-                    rope_theta: 1000000.0,
-                    use_flash_attn: false,
-                    bos_token_id: Some(151643),
-                    eos_token_id: Some(LlamaEosToks::Single(151645)),
-                    max_position_embeddings: 131072,
-                    rope_scaling: None,
-                    tie_word_embeddings: false,
-                 }
-             } else if path.contains("70b") || path.contains("72b") || path.contains("humotica-72") || (path.contains("qwen") && (path.contains("72") || path.contains("70"))) {
+             } else if path.contains("70b") || path.contains("72b") || path.contains("humotica-72") {
                  // Qwen 2.5 72B config
-                 println!("🦣 QWEN 72B DETECTED: Using Qwen config (Hidden: 8192, Vocab: 152064).");
+                 println!("🐘 QWEN 72B DETECTED: Using Qwen config (Hidden: 8192, Vocab: 152064).");
                  Config {
                     hidden_size: 8192,
                     intermediate_size: 28672,
-                    vocab_size: 152064,
+                    vocab_size: 152064, // Qwen 2.5 default vocab
                     num_hidden_layers: 80,
                     num_attention_heads: 64,
                     num_key_value_heads: 8,
                     rms_norm_eps: 1e-5,
-                    rope_theta: 1000000.0,
+                    rope_theta: 500000.0,
                     use_flash_attn: false,
                     bos_token_id: Some(151643),
                     eos_token_id: Some(LlamaEosToks::Single(151645)),
-                    max_position_embeddings: 131072,
+                    max_position_embeddings: 8192,
                     rope_scaling: None,
                     tie_word_embeddings: false,
                  }
@@ -834,7 +890,7 @@ impl GhostLlama {
             else { return Err("No model found. Please provide --model <path.oom>".into()); }
         };
 
-        let model = GhostLlamaModel::new(device.clone(), secondary_device.clone(), loader.clone(), LlamaConfig::from(config.clone()));
+        let model = GhostLlamaModel::new(device.clone(), secondary_device, loader.clone(), LlamaConfig::from(config.clone()));
 
         // 🚀 Initialize TurboEngine based on model config
         let turbo = if gpu_index.is_some() {
@@ -857,10 +913,9 @@ impl GhostLlama {
                     prefetch_lookahead: 2,
                     use_flash_attention: true,
                     use_fp16: true,
-                    rope_theta: config.rope_theta, // Use model's RoPE theta
                 }
             };
-            Some(TurboEngine::new_dual(turbo_config, device.clone(), secondary_device.clone()))
+            Some(TurboEngine::new(turbo_config, device.clone()))
         } else {
             println!("⚠️ TURBO disabled (CPU mode) - KV-Cache requires GPU");
             None
@@ -878,7 +933,6 @@ impl GhostLlama {
             betti,
             allocation_id: allocation,
             name: name.to_string(),
-            sampler: Sampler::default(), // temperature=0.7, top_p=0.9, top_k=40
         })
     }
 
@@ -898,20 +952,8 @@ impl GhostLlama {
             "".to_string()
         };
 
-        // Detect model type for chat template
-        let is_qwen = self.config.vocab_size == 152064;
-        let is_llama3 = self.config.vocab_size == 128256;
-
-        let full_prompt = if is_qwen {
-            // Qwen chat template: <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
-            format!("{}<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", context_prefix, prompt)
-        } else if is_llama3 {
-            // Llama 3 chat template
-            format!("{}<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", context_prefix, prompt)
-        } else {
-            // TinyLlama chat template format
-            format!("{}<|user|>\n{}</s>\n<|assistant|>\n", context_prefix, prompt)
-        };
+        // Use Qwen's ChatML format
+        let full_prompt = format!("{}<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", context_prefix, prompt);
         let tokens = self.tokenizer.encode(full_prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
         let prompt_len = tokens.len();
 
@@ -930,38 +972,39 @@ impl GhostLlama {
             // Get first generated token: logits is [batch=1, seq, vocab]
             let seq_len = logits.dim(1)?;
             let last_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?; // [1, vocab]
+            let next_token_idx = last_logits.argmax(candle_core::D::Minus1)?; // [1]
+            let mut next_token = next_token_idx.squeeze(0)?.to_scalar::<u32>()?; // scalar
 
-            let mut logits_vec = last_logits.flatten_all()?.to_vec1::<f32>()?;
-            let mut next_token = self.sampler.sample(&mut logits_vec);
             let mut generated_tokens: Vec<u32> = Vec::new();
 
             // Autoregressive generation with KV-cache
             for i in 0..max_tokens {
                 // Check EOS
                 if next_token == 2 || next_token == 151643 || next_token == 128001 || next_token == 151645 {
+                    println!("🛑 EOS token reached at step {}", i);
                     break;
                 }
 
                 generated_tokens.push(next_token);
 
                 if i % 5 == 0 {
-                    println!("🔤 Generated {} tokens...", i + 1);
+                    let cached = turbo.seq_len();
+                    println!("🚀 Generated {} tokens (KV-cache: {} entries)...", i + 1, cached);
                 }
 
                 // TURBO: Only pass the NEW token - KV-cache handles history!
                 let new_token_tensor = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
                 let logits = self.model.forward_turbo(&new_token_tensor, turbo)?;
 
-                // Get next token with sampling
+                // Get next token
                 let seq_len = logits.dim(1)?;
                 let last_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
-
-                // 🎲 Sample next token (not argmax!)
-                let mut logits_vec = last_logits.flatten_all()?.to_vec1::<f32>()?;
-                next_token = self.sampler.sample(&mut logits_vec);
+                let next_token_idx = last_logits.argmax(candle_core::D::Minus1)?;
+                next_token = next_token_idx.squeeze(0)?.to_scalar::<u32>()?;
             }
 
-            println!("🔢 Generated token IDs: {:?}", &generated_tokens);
+            println!("🚀 TURBO complete! {} tokens generated (prompt: {}, KV-cache: {} entries)",
+                     generated_tokens.len(), prompt_len, turbo.seq_len());
 
             let output = self.tokenizer.decode(&generated_tokens, true).map_err(|e| e.to_string())?;
             Ok(output)
@@ -977,17 +1020,23 @@ impl GhostLlama {
                 let logits = self.model.forward(&current_input)?;
 
                 let seq_len = logits.dim(1)?;
-                let last_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
-                // 🎲 Sample next token (not argmax!)
-                let mut logits_vec = last_logits.flatten_all()?.to_vec1::<f32>()?;
-
-                let next_token = self.sampler.sample(&mut logits_vec);
+                let last_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?; // [batch, vocab]
+                // Get argmax, then squeeze batch dim if present
+                let next_token_tensor = last_logits.argmax(candle_core::D::Minus1)?; // [batch] or scalar
+                let next_token = if next_token_tensor.dims().is_empty() {
+                    next_token_tensor.to_scalar::<u32>()?
+                } else {
+                    // Squeeze any remaining dimensions and get first element
+                    next_token_tensor.flatten_all()?.to_vec1::<u32>()?[0]
+                };
 
                 if next_token == 2 || next_token == 151643 || next_token == 128001 || next_token == 151645 {
+                    println!("🛑 EOS token reached at step {}", i);
                     break;
                 }
 
                 generated_tokens.push(next_token);
+                println!("🔢 Token {}: {} (seq_len={})", i, next_token, current_input.dim(1)?);
 
                 // Without KV-cache: must pass full sequence each time
                 let new_token = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
@@ -998,9 +1047,8 @@ impl GhostLlama {
                 }
             }
 
-            println!("🔢 Generated token IDs: {:?}", &generated_tokens);
+            println!("✅ Generation complete ({} tokens).", generated_tokens.len());
             let output = self.tokenizer.decode(&generated_tokens, true).map_err(|e| e.to_string())?;
-            println!("📝 Decoded output: {:?}", output);
             Ok(output)
         }
     }
@@ -1016,27 +1064,58 @@ impl GhostLlama {
 pub type OomLlama = GhostLlama;
 
 fn infer_shape(name: &str, config: &LlamaConfig) -> Shape {
+    // GGUF stores weights as [out_features, in_features] in row-major memory,
+    // same as PyTorch convention. GhostLinear.forward() does x @ w.T.
+    // We return shapes matching the GGUF row-major memory layout.
+    //
+    // GGUF "shape" field is innermost-first, e.g. gate_proj says [3584, 18944],
+    // which means the data in row-major memory is [18944 rows, 3584 cols] =
+    // [out_features=18944, in_features=3584].
+
     if name.contains("embed_tokens") {
+        // Embedding: [vocab_size, hidden_size] - used for lookup, not matmul
         return Shape::from((config.vocab_size, config.hidden_size));
     }
     if name.contains("lm_head") {
+        // GGUF memory: [vocab_size, hidden_size] = [152064, 3584]
         return Shape::from((config.vocab_size, config.hidden_size));
     }
     if name.contains("input_layernorm") || name.contains("post_attention_layernorm") || name == "model.norm.weight" {
         return Shape::from((config.hidden_size,));
     }
+    // Handle attention projection BIASES first (1D tensors)
+    if name.ends_with(".bias") {
+        if name.contains("q_proj") || name.contains("o_proj") {
+            return Shape::from((config.hidden_size,));
+        }
+        if name.contains("k_proj") || name.contains("v_proj") {
+            let kv_heads = config.num_key_value_heads.unwrap_or(config.num_attention_heads);
+            let head_dim = config.hidden_size / config.num_attention_heads;
+            return Shape::from((kv_heads * head_dim,));
+        }
+    }
+    // Handle attention projection WEIGHTS (2D tensors)
+    // GGUF memory layout: [out_features, in_features]
     if name.contains("q_proj") || name.contains("k_proj") || name.contains("v_proj") || name.contains("o_proj") {
         if name.contains("k_proj") || name.contains("v_proj") {
             let kv_heads = config.num_key_value_heads.unwrap_or(config.num_attention_heads);
             let head_dim = config.hidden_size / config.num_attention_heads;
+            // Memory: [kv_dim, hidden_size] = [512, 3584]
             return Shape::from((kv_heads * head_dim, config.hidden_size));
         }
+        if name.contains("o_proj") {
+            // Memory: [hidden_size, hidden_size] = [3584, 3584] (symmetric)
+            return Shape::from((config.hidden_size, config.hidden_size));
+        }
+        // q_proj: Memory: [hidden_size, hidden_size] = [3584, 3584] (symmetric)
         return Shape::from((config.hidden_size, config.hidden_size));
     }
     if name.contains("gate_proj") || name.contains("up_proj") {
+        // Memory: [intermediate_size, hidden_size] = [18944, 3584]
         return Shape::from((config.intermediate_size, config.hidden_size));
     }
     if name.contains("down_proj") {
+        // Memory: [hidden_size, intermediate_size] = [3584, 18944]
         return Shape::from((config.hidden_size, config.intermediate_size));
     }
     Shape::from((0,)) // Fallback

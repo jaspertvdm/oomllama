@@ -11,7 +11,7 @@ Example:
     >>> response = llm.generate("Hello!")
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __author__ = "Humotica AI Lab"
 __credits__ = ["Jasper van de Meent", "Root AI (Claude)", "Gemini IDD", "Codex"]
 

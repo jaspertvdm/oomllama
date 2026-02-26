@@ -368,75 +368,80 @@ fn dequant_q4_0(data: &[u8], output: &mut [f32]) -> Result<()> {
         let block_offset = i * bytes_per_block;
         let scale = f16_to_f32(u16::from_le_bytes(data[block_offset..block_offset+2].try_into()?));
 
+        // Matches llama.cpp: low nibbles first (0..15), then high nibbles (16..31)
         for j in 0..16 {
             let byte = data[block_offset + 2 + j];
-            let q0 = (byte & 0x0F) as i8 - 8;
-            let q1 = ((byte >> 4) & 0x0F) as i8 - 8;
-            output[i * block_size + j * 2] = scale * q0 as f32;
-            output[i * block_size + j * 2 + 1] = scale * q1 as f32;
+            let q_lo = (byte & 0x0F) as i8 - 8;
+            let q_hi = ((byte >> 4) & 0x0F) as i8 - 8;
+            output[i * block_size + j] = scale * q_lo as f32;
+            output[i * block_size + j + 16] = scale * q_hi as f32;
         }
     }
     Ok(())
 }
 
 // Q4_K dequantization (block size 256, super-blocks)
-// Based on llama.cpp ggml-quants.c implementation
+// Based on llama.cpp dequantize_row_q4_K
 fn dequant_q4_k(data: &[u8], output: &mut [f32]) -> Result<()> {
-    let super_block_size = 256;  // QK_K
+    let super_block_size = 256;
     let n_super_blocks = output.len() / super_block_size;
 
     // Q4_K structure: d (f16), dmin (f16), scales (12 bytes), qs (128 bytes) = 144 bytes
     let bytes_per_super_block = 144;
 
-    // Helper to extract scale and min from packed format (llama.cpp get_scale_min_k4)
-    fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
-        if j < 4 {
-            (scales[j] & 63, scales[j + 4] & 63)
-        } else {
-            let sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
-            let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-            (sc, m)
-        }
-    }
-
     for sb in 0..n_super_blocks {
         let sb_offset = sb * bytes_per_super_block;
-
-        if sb_offset + bytes_per_super_block > data.len() {
-            break;
-        }
-
         let d = f16_to_f32(u16::from_le_bytes(data[sb_offset..sb_offset+2].try_into()?));
         let dmin = f16_to_f32(u16::from_le_bytes(data[sb_offset+2..sb_offset+4].try_into()?));
 
-        let scales = &data[sb_offset + 4..sb_offset + 16];
-        let qs = &data[sb_offset + 16..sb_offset + 144];
+        // Unpack scales and mins from 12 bytes for 8 sub-blocks
+        // Format: scales[0-3] in low 6 bits, scales[4-7] in next bytes' low 6 bits
+        //         mins[0-3] in low 6 bits offset, mins[4-7] in next
+        //         High 2 bits stored separately
+        let scales_bytes = &data[sb_offset + 4..sb_offset + 16];
+        let qs_offset = sb_offset + 16;
 
-        // Process 4 pairs of sub-blocks (8 total, 32 values each = 256)
-        let mut out_idx = sb * super_block_size;
-        let mut q_idx = 0;
+        // Decode scales and mins (simplified but more accurate than before)
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
 
-        for j in 0..4 {  // QK_K/64 = 4 iterations
-            // Get scales and mins for 2 sub-blocks
-            let (sc1, m1) = get_scale_min_k4(j * 2, scales);
-            let (sc2, m2) = get_scale_min_k4(j * 2 + 1, scales);
+        // First 4 scales and mins from first 6 bytes
+        scales[0] = scales_bytes[0] & 0x3F;
+        scales[1] = scales_bytes[1] & 0x3F;
+        scales[2] = scales_bytes[2] & 0x3F;
+        scales[3] = scales_bytes[3] & 0x3F;
 
-            let d1 = d * sc1 as f32;
-            let min1 = dmin * m1 as f32;
-            let d2 = d * sc2 as f32;
-            let min2 = dmin * m2 as f32;
+        mins[0] = scales_bytes[4] & 0x3F;
+        mins[1] = scales_bytes[5] & 0x3F;
+        mins[2] = scales_bytes[6] & 0x3F;
+        mins[3] = scales_bytes[7] & 0x3F;
 
-            // Each iteration processes 64 values (2 sub-blocks of 32)
+        // Last 4 scales and mins with high bits from bytes 8-11
+        scales[4] = (scales_bytes[0] >> 6) | ((scales_bytes[8] & 0x0F) << 2);
+        scales[5] = (scales_bytes[1] >> 6) | ((scales_bytes[8] >> 4) << 2);
+        scales[6] = (scales_bytes[2] >> 6) | ((scales_bytes[9] & 0x0F) << 2);
+        scales[7] = (scales_bytes[3] >> 6) | ((scales_bytes[9] >> 4) << 2);
+
+        mins[4] = (scales_bytes[4] >> 6) | ((scales_bytes[10] & 0x0F) << 2);
+        mins[5] = (scales_bytes[5] >> 6) | ((scales_bytes[10] >> 4) << 2);
+        mins[6] = (scales_bytes[6] >> 6) | ((scales_bytes[11] & 0x0F) << 2);
+        mins[7] = (scales_bytes[7] >> 6) | ((scales_bytes[11] >> 4) << 2);
+
+        // Matches llama.cpp dequantize_row_q4_K exactly:
+        // Process 256 values in 4 groups of 64 (32 low nibbles + 32 high nibbles)
+        for j in 0..4 {
+            let q_off = qs_offset + j * 32;
+            let dl1 = d * scales[2 * j] as f32;
+            let ml1 = dmin * mins[2 * j] as f32;
+            let dl2 = d * scales[2 * j + 1] as f32;
+            let ml2 = dmin * mins[2 * j + 1] as f32;
+            let out_base = sb * super_block_size + j * 64;
+
             for l in 0..32 {
-                let q_byte = qs[q_idx + l];
-                // Lower nibble -> first sub-block
-                output[out_idx + l] = d1 * (q_byte & 0xF) as f32 - min1;
-                // Upper nibble -> second sub-block
-                output[out_idx + 32 + l] = d2 * (q_byte >> 4) as f32 - min2;
+                let byte = data[q_off + l];
+                output[out_base + l]      = dl1 * (byte & 0x0F) as f32 - ml1;
+                output[out_base + l + 32] = dl2 * (byte >> 4) as f32 - ml2;
             }
-
-            out_idx += 64;
-            q_idx += 32;
         }
     }
     Ok(())
@@ -460,128 +465,222 @@ fn dequant_q8_0(data: &[u8], output: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
-// Q6_K dequantization - proper implementation based on llama.cpp
+// Q6_K dequantization (256 values per block)
+// Based on llama.cpp block_q6_K structure:
+// - ql (128 bytes): lower 4 bits (2 values per byte)
+// - qh (64 bytes): upper 2 bits (4 values per byte)
+// - scales (16 bytes): 8 sub-block scales
+// - d (2 bytes fp16): super-block scale
 fn dequant_q6_k(data: &[u8], output: &mut [f32]) -> Result<()> {
-    // Q6_K block layout (210 bytes for 256 values):
-    // - ql[128]: lower 4 bits of each quant (256 values * 4 bits / 8 = 128 bytes)
-    // - qh[64]:  upper 2 bits of each quant (256 values * 2 bits / 8 = 64 bytes)
-    // - scales[16]: per-sub-block scales (16 sub-blocks, signed i8)
-    // - d[2]: super-block scale (f16)
-    const QK_K: usize = 256;
-    const BLOCK_SIZE: usize = 210;
+    let super_block_size = 256;
+    let n_blocks = output.len() / super_block_size;
+    let bytes_per_block = 210; // ql[128] + qh[64] + scales[16] + d(f16)
 
-    let n_blocks = output.len() / QK_K;
+    for blk in 0..n_blocks {
+        let offset = blk * bytes_per_block;
 
-    for i in 0..n_blocks {
-        let block_start = i * BLOCK_SIZE;
-        if block_start + BLOCK_SIZE > data.len() {
-            // Fill remainder with zeros
-            for j in i * QK_K..output.len() {
-                output[j] = 0.0;
-            }
-            break;
-        }
+        // Read components (llama.cpp layout: ql, qh, scales, d)
+        let ql = &data[offset..offset + 128];
+        let qh = &data[offset + 128..offset + 192];
+        let scales = &data[offset + 192..offset + 208];
+        let d = f16_to_f32(u16::from_le_bytes(data[offset + 208..offset + 210].try_into()?));
 
-        let block = &data[block_start..block_start + BLOCK_SIZE];
+        let out_base = blk * super_block_size;
 
-        // Parse block layout
-        let ql = &block[0..128];       // low 4 bits
-        let qh = &block[128..192];     // high 2 bits
-        let scales = &block[192..208]; // sub-block scales (signed i8)
-        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
-
-        let out_base = i * QK_K;
-
-        // Process in two halves of 128 values each
-        for half in 0..2 {
-            let ql_off = half * 64;
-            let qh_off = half * 32;
-            let sc_off = half * 8;
+        // Matches llama.cpp dequantize_row_q6_K exactly:
+        // Process 256 values in 2 chunks of 128, each chunk has 4 interleaved sub-groups
+        for n in (0..256).step_by(128) {
+            let ql_off = n / 2;   // 64 ql bytes per 128 values
+            let qh_off = n / 4;   // 32 qh bytes per 128 values
+            let sc_off = n / 16;  // 8 scales per 128 values
 
             for l in 0..32 {
-                // Which sub-block within this half (0 or 1)
-                let is = l / 16;
+                let is = l / 16; // 0 for l=0..15, 1 for l=16..31
 
-                // Read quantized bytes
-                let ql0 = ql[ql_off + l];
-                let ql32 = ql[ql_off + l + 32];
-                let qh_byte = qh[qh_off + l];
+                let q1 = ((ql[ql_off + l] & 0xF) as i32 | (((qh[qh_off + l] as i32 >> 0) & 3) << 4)) - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0xF) as i32 | (((qh[qh_off + l] as i32 >> 2) & 3) << 4)) - 32;
+                let q3 = ((ql[ql_off + l] >> 4) as i32 | (((qh[qh_off + l] as i32 >> 4) & 3) << 4)) - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4) as i32 | (((qh[qh_off + l] as i32 >> 6) & 3) << 4)) - 32;
 
-                // Extract 6-bit values: combine low 4 bits + high 2 bits, subtract 32 to center
-                let q1 = (((ql0 & 0x0F) | ((qh_byte & 0x03) << 4)) as i8).wrapping_sub(32);
-                let q2 = (((ql32 & 0x0F) | (((qh_byte >> 2) & 0x03) << 4)) as i8).wrapping_sub(32);
-                let q3 = (((ql0 >> 4) | (((qh_byte >> 4) & 0x03) << 4)) as i8).wrapping_sub(32);
-                let q4 = (((ql32 >> 4) | ((qh_byte >> 6) << 4)) as i8).wrapping_sub(32);
+                let sc1 = scales[sc_off + is] as i8 as f32;
+                let sc2 = scales[sc_off + is + 2] as i8 as f32;
+                let sc3 = scales[sc_off + is + 4] as i8 as f32;
+                let sc4 = scales[sc_off + is + 6] as i8 as f32;
 
-                // Get scales for each output position (signed i8)
-                let sc0 = scales[sc_off + is] as i8 as f32;
-                let sc1 = scales[sc_off + is + 2] as i8 as f32;
-                let sc2 = scales[sc_off + is + 4] as i8 as f32;
-                let sc3 = scales[sc_off + is + 6] as i8 as f32;
-
-                // Write outputs
-                let base = out_base + half * 128;
-                output[base + l] = d * sc0 * q1 as f32;
-                output[base + l + 32] = d * sc1 * q2 as f32;
-                output[base + l + 64] = d * sc2 * q3 as f32;
-                output[base + l + 96] = d * sc3 * q4 as f32;
+                output[out_base + n + l]      = d * sc1 * q1 as f32;
+                output[out_base + n + l + 32] = d * sc2 * q2 as f32;
+                output[out_base + n + l + 64] = d * sc3 * q3 as f32;
+                output[out_base + n + l + 96] = d * sc4 * q4 as f32;
             }
         }
     }
     Ok(())
 }
 
-// Q5_K dequantization (simplified)
+// Q5_K dequantization (block size 256)
+// Layout: d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] = 176 bytes
 fn dequant_q5_k(data: &[u8], output: &mut [f32]) -> Result<()> {
     let super_block_size = 256;
     let n_blocks = output.len() / super_block_size;
     let bytes_per_block = 176;
 
-    for i in 0..n_blocks {
-        let offset = i * bytes_per_block;
-        let scale = f16_to_f32(u16::from_le_bytes(data[offset..offset+2].try_into().unwrap_or([0,0])));
+    for blk in 0..n_blocks {
+        let offset = blk * bytes_per_block;
+        let d = f16_to_f32(u16::from_le_bytes(data[offset..offset+2].try_into()?));
+        let dmin = f16_to_f32(u16::from_le_bytes(data[offset+2..offset+4].try_into()?));
+        let scales_bytes = &data[offset + 4..offset + 16];
+        let qh = &data[offset + 16..offset + 48];
+        let qs = &data[offset + 48..offset + 176];
 
-        for j in 0..super_block_size {
-            let q = ((data.get(offset + 4 + j / 2).unwrap_or(&0) >> ((j % 2) * 4)) & 0x1F) as i8 - 16;
-            output[i * super_block_size + j] = scale * q as f32;
+        // Decode scales and mins (same packing as Q4_K)
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        scales[0] = scales_bytes[0] & 0x3F;
+        scales[1] = scales_bytes[1] & 0x3F;
+        scales[2] = scales_bytes[2] & 0x3F;
+        scales[3] = scales_bytes[3] & 0x3F;
+        mins[0] = scales_bytes[4] & 0x3F;
+        mins[1] = scales_bytes[5] & 0x3F;
+        mins[2] = scales_bytes[6] & 0x3F;
+        mins[3] = scales_bytes[7] & 0x3F;
+        scales[4] = (scales_bytes[0] >> 6) | ((scales_bytes[8] & 0x0F) << 2);
+        scales[5] = (scales_bytes[1] >> 6) | ((scales_bytes[8] >> 4) << 2);
+        scales[6] = (scales_bytes[2] >> 6) | ((scales_bytes[9] & 0x0F) << 2);
+        scales[7] = (scales_bytes[3] >> 6) | ((scales_bytes[9] >> 4) << 2);
+        mins[4] = (scales_bytes[4] >> 6) | ((scales_bytes[10] & 0x0F) << 2);
+        mins[5] = (scales_bytes[5] >> 6) | ((scales_bytes[10] >> 4) << 2);
+        mins[6] = (scales_bytes[6] >> 6) | ((scales_bytes[11] & 0x0F) << 2);
+        mins[7] = (scales_bytes[7] >> 6) | ((scales_bytes[11] >> 4) << 2);
+
+        // Matches llama.cpp dequantize_row_q5_K exactly:
+        // 4 groups of 64 values (32 low nibbles + 32 high nibbles, each with 5th bit from qh)
+        for j in 0..4 {
+            let ql_off = j * 32;
+            let qh_off = j * 8;
+            let dl1 = d * scales[2 * j] as f32;
+            let ml1 = dmin * mins[2 * j] as f32;
+            let dl2 = d * scales[2 * j + 1] as f32;
+            let ml2 = dmin * mins[2 * j + 1] as f32;
+            let out_base = blk * super_block_size + j * 64;
+
+            for l in 0..32 {
+                let hm = qh[qh_off + l / 8] >> (l % 8);
+                let q_lo = (qs[ql_off + l] & 0x0F) as u32 + if hm & 1 != 0 { 16 } else { 0 };
+                let q_hi = (qs[ql_off + l] >> 4) as u32 + if hm & 2 != 0 { 16 } else { 0 };
+                output[out_base + l]      = dl1 * q_lo as f32 - ml1;
+                output[out_base + l + 32] = dl2 * q_hi as f32 - ml2;
+            }
         }
     }
     Ok(())
 }
 
-// Q2_K dequantization (simplified)
+// Q2_K dequantization (block size 256)
+// Layout: scales[16] + qs[64] + d(f16) + dmin(f16) = 84 bytes
+// NOTE: d and dmin are at the END (offset 80, 82), NOT the beginning!
 fn dequant_q2_k(data: &[u8], output: &mut [f32]) -> Result<()> {
     let super_block_size = 256;
     let n_blocks = output.len() / super_block_size;
     let bytes_per_block = 84;
 
-    for i in 0..n_blocks {
-        let offset = i * bytes_per_block;
-        let scale = f16_to_f32(u16::from_le_bytes(data[offset..offset+2].try_into().unwrap_or([0,0])));
+    for blk in 0..n_blocks {
+        let offset = blk * bytes_per_block;
+        // scales[16] at offset 0-15
+        let scales = &data[offset..offset + 16];
+        // qs[64] at offset 16-79
+        let qs = &data[offset + 16..offset + 80];
+        // d and dmin at END
+        let d = f16_to_f32(u16::from_le_bytes(data[offset + 80..offset + 82].try_into()?));
+        let dmin = f16_to_f32(u16::from_le_bytes(data[offset + 82..offset + 84].try_into()?));
 
-        for j in 0..super_block_size {
-            let byte_idx = j / 4;
-            let bit_shift = (j % 4) * 2;
-            let q = ((data.get(offset + 4 + byte_idx).unwrap_or(&0) >> bit_shift) & 0x03) as i8 - 2;
-            output[i * super_block_size + j] = scale * q as f32;
+        // 16 sub-blocks of 16 values each
+        // Each scale byte: low nibble = scale, high nibble = min
+        for sub in 0..16 {
+            let sc = (scales[sub] & 0x0F) as f32;
+            let m = (scales[sub] >> 4) as f32;
+            let dl = d * sc;
+            let ml = dmin * m;
+
+            for j in 0..16 {
+                let idx = sub * 16 + j;
+                let byte_idx = idx / 4;
+                let bit_shift = (idx % 4) * 2;
+                let q = ((qs[byte_idx] >> bit_shift) & 0x03) as f32;
+                output[blk * super_block_size + idx] = dl * q - ml;
+            }
         }
     }
     Ok(())
 }
 
-// Q3_K dequantization (simplified)
+// Q3_K dequantization (block size 256)
+// Layout: hmask[32] + qs[64] + scales[12] + d(f16) = 110 bytes
+// NOTE: d is at the END (offset 108), NOT the beginning!
 fn dequant_q3_k(data: &[u8], output: &mut [f32]) -> Result<()> {
     let super_block_size = 256;
     let n_blocks = output.len() / super_block_size;
     let bytes_per_block = 110;
 
-    for i in 0..n_blocks {
-        let offset = i * bytes_per_block;
-        let scale = f16_to_f32(u16::from_le_bytes(data[offset..offset+2].try_into().unwrap_or([0,0])));
+    for blk in 0..n_blocks {
+        let offset = blk * bytes_per_block;
+        let hmask = &data[offset..offset + 32];
+        let qs = &data[offset + 32..offset + 96];
+        let scales_raw = &data[offset + 96..offset + 108];
+        let d = f16_to_f32(u16::from_le_bytes(data[offset + 108..offset + 110].try_into()?));
 
-        for j in 0..super_block_size {
-            let q = ((data.get(offset + 4 + j / 3).unwrap_or(&0) >> ((j % 3) * 2)) & 0x07) as i8 - 4;
-            output[i * super_block_size + j] = scale * q as f32;
+        // Decode 16 scales from 12 bytes (same packing as Q4_K but 16 scales not 8)
+        let mut scales = [0i32; 16];
+        for i in 0..8 {
+            scales[i] = (scales_raw[i] & 0x0F) as i32;
+        }
+        for i in 0..8 {
+            scales[i + 8] = (scales_raw[i] >> 4) as i32;
+        }
+        // Adjust with high bits from scales_raw[8..12]
+        for i in 0..4 {
+            let m = scales_raw[8 + i];
+            scales[2 * i] = (scales[2 * i] & 0x0F) | (((m & 0x03) as i32) << 4);
+            scales[2 * i + 1] = (scales[2 * i + 1] & 0x0F) | ((((m >> 2) & 0x03) as i32) << 4);
+            scales[2 * i + 8] = (scales[2 * i + 8] & 0x0F) | ((((m >> 4) & 0x03) as i32) << 4);
+            scales[2 * i + 9] = (scales[2 * i + 9] & 0x0F) | ((((m >> 6) & 0x03) as i32) << 4);
+        }
+        // Center scales: subtract 32
+        for i in 0..16 {
+            scales[i] -= 32;
+        }
+
+        // Decode 256 3-bit values using interleaved access pattern matching llama.cpp/gguf.
+        // qs[64]: 2 groups of 32 bytes, each byte has 4 2-bit values at shifts 0,2,4,6.
+        // hmask[32]: 256 bits, accessed in interleaved order.
+        // Output layout: 16 sub-blocks of 16 values, indexed as flat_idx = sub*16 + pos.
+        //
+        // For flat_idx in 0..255:
+        //   qs group = flat_idx / 128
+        //   qs shift = (flat_idx % 128) / 32
+        //   qs byte = flat_idx % 32
+        //   hmask shift = flat_idx / 32
+        //   hmask byte = flat_idx % 32
+        //   hmask bit INVERTED: 1 means no offset, 0 means subtract 4
+        let out_base = blk * super_block_size;
+        for j in 0..256usize {
+            let sub = j / 16;
+            let sc = scales[sub] as f32;
+
+            // Interleaved ql access
+            let qs_group = j / 128;      // 0 or 1 (which 32-byte group)
+            let qs_shift = ((j % 128) / 32) * 2;  // bit shift: 0, 2, 4, or 6
+            let qs_byte_in_group = j % 32;
+            let qs_byte_idx = qs_group * 32 + qs_byte_in_group;
+            let q_lo = ((qs[qs_byte_idx] >> qs_shift) & 0x03) as i32;
+
+            // Interleaved hmask access (inverted: bit=1 means offset=0)
+            let hm_shift = j / 32;
+            let hm_byte = j % 32;
+            let hm_bit = (hmask[hm_byte] >> hm_shift) & 1;
+            let hm_inv = (hm_bit ^ 1) as i32;  // invert: 0→1 (apply offset), 1→0
+
+            let q = q_lo - (hm_inv << 2);
+            output[out_base + j] = d * sc * (q as f32);
         }
     }
     Ok(())
@@ -636,22 +735,12 @@ impl OomWriter {
             let end = (start + BLOCK_SIZE).min(num_values);
             let block_values = &values[start..end];
 
-            // Find min/max (skip NaN/inf values)
+            // Find min/max
             let mut min = f32::MAX;
             let mut max = f32::MIN;
-            let mut valid_count = 0;
             for &v in block_values {
-                if v.is_finite() {
-                    if v < min { min = v; }
-                    if v > max { max = v; }
-                    valid_count += 1;
-                }
-            }
-
-            // Handle blocks with no valid values or empty blocks
-            if valid_count == 0 || min > max {
-                min = 0.0;
-                max = 0.0;
+                if v < min { min = v; }
+                if v > max { max = v; }
             }
 
             let range = max - min;
@@ -663,9 +752,9 @@ impl OomWriter {
             let mut shift = 0;
 
             for &v in block_values {
-                let q = if scale == 0.0 || !v.is_finite() { 0 } else {
+                let q = if scale == 0.0 { 0 } else {
                     let norm = (v - min) / scale;
-                    (norm.round().clamp(0.0, 3.0) as u8)
+                    (norm.round() as u8).min(3)
                 };
                 current_byte |= q << shift;
                 shift += 2;
@@ -688,78 +777,9 @@ impl OomWriter {
         Ok(())
     }
 
-    /// Add a tensor (quantizes to Q4 - 4 bits per value, 16 levels)
-    pub fn add_tensor_q4(&mut self, name: &str, values: &[f32]) -> Result<()> {
-        let num_values = values.len();
-        let num_blocks = (num_values + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-        // Write tensor header
-        let name_bytes = name.as_bytes();
-        self.tensor_data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        self.tensor_data.extend_from_slice(name_bytes);
-        self.tensor_data.push(4); // Q4
-        self.tensor_data.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-        self.tensor_data.extend_from_slice(&(num_values as u32).to_le_bytes());
-
-        // Write blocks
-        for block_idx in 0..num_blocks {
-            let start = block_idx * BLOCK_SIZE;
-            let end = (start + BLOCK_SIZE).min(num_values);
-            let block_values = &values[start..end];
-
-            // Find min/max (skip NaN/inf values)
-            let mut min = f32::MAX;
-            let mut max = f32::MIN;
-            let mut valid_count = 0;
-            for &v in block_values {
-                if v.is_finite() {
-                    if v < min { min = v; }
-                    if v > max { max = v; }
-                    valid_count += 1;
-                }
-            }
-
-            if valid_count == 0 || min > max {
-                min = 0.0;
-                max = 0.0;
-            }
-
-            let range = max - min;
-            let scale = if range.abs() < 1e-9 { 0.0 } else { range / 15.0 };
-
-            // Quantize to 4 bits (2 values per byte)
-            let mut qdata = Vec::with_capacity((block_values.len() + 1) / 2);
-            let mut current_byte: u8 = 0;
-            let mut shift = 0;
-
-            for &v in block_values {
-                let q = if scale == 0.0 || !v.is_finite() { 0 } else {
-                    let norm = (v - min) / scale;
-                    (norm.round().clamp(0.0, 15.0) as u8)
-                };
-                current_byte |= q << shift;
-                shift += 4;
-                if shift == 8 {
-                    qdata.push(current_byte);
-                    current_byte = 0;
-                    shift = 0;
-                }
-            }
-            if shift > 0 { qdata.push(current_byte); }
-
-            // Write block: scale (f32) + min (f32) + data_len (u32) + qdata
-            self.tensor_data.extend_from_slice(&scale.to_le_bytes());
-            self.tensor_data.extend_from_slice(&min.to_le_bytes());
-            self.tensor_data.extend_from_slice(&(qdata.len() as u32).to_le_bytes());
-            self.tensor_data.extend_from_slice(&qdata);
-        }
-
-        self.tensor_count += 1;
-        Ok(())
-    }
-
-    /// Add a tensor (quantizes to Q8 - 8 bits per value, 256 levels)
-    /// Use for sensitive tensors like lm_head and embed_tokens
+    /// Add a tensor (quantizes to Q8 - much higher quality than Q2!)
+    /// Q8: 256 levels per value vs Q2's 4 levels
+    /// Formula: q = round((value - min) / scale * 255)
     pub fn add_tensor_q8(&mut self, name: &str, values: &[f32]) -> Result<()> {
         let num_values = values.len();
         let num_blocks = (num_values + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -778,33 +798,23 @@ impl OomWriter {
             let end = (start + BLOCK_SIZE).min(num_values);
             let block_values = &values[start..end];
 
-            // Find min/max (skip NaN/inf values)
+            // Find min/max
             let mut min = f32::MAX;
             let mut max = f32::MIN;
-            let mut valid_count = 0;
             for &v in block_values {
-                if v.is_finite() {
-                    if v < min { min = v; }
-                    if v > max { max = v; }
-                    valid_count += 1;
-                }
-            }
-
-            if valid_count == 0 || min > max {
-                min = 0.0;
-                max = 0.0;
+                if v < min { min = v; }
+                if v > max { max = v; }
             }
 
             let range = max - min;
             let scale = if range.abs() < 1e-9 { 0.0 } else { range / 255.0 };
 
-            // Quantize to 8 bits (1 value per byte)
+            // Quantize to Q8 (one byte per value)
             let mut qdata = Vec::with_capacity(block_values.len());
-
             for &v in block_values {
-                let q = if scale == 0.0 || !v.is_finite() { 0 } else {
+                let q = if scale == 0.0 { 0 } else {
                     let norm = (v - min) / scale;
-                    (norm.round().clamp(0.0, 255.0) as u8)
+                    (norm.round() as u8)
                 };
                 qdata.push(q);
             }
@@ -820,9 +830,40 @@ impl OomWriter {
         Ok(())
     }
 
-    /// Add a tensor (stores as F32 - no quantization)
-    /// Use for debugging or when precision is critical
+    /// Add a tensor as raw F32 (no quantization - full precision)
+    /// Used for norm weights that need exact values
     pub fn add_tensor_f32(&mut self, name: &str, values: &[f32]) -> Result<()> {
+        let num_values = values.len();
+
+        // Write tensor header
+        let name_bytes = name.as_bytes();
+        self.tensor_data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        self.tensor_data.extend_from_slice(name_bytes);
+        self.tensor_data.push(0); // F32 (quant_type = 0)
+        self.tensor_data.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
+        self.tensor_data.extend_from_slice(&(num_values as u32).to_le_bytes());
+
+        // Write single "block" with raw F32 data
+        // For F32: we use data_len field to indicate byte count, no scale/min needed
+        // Format: scale=0.0 (unused), min=0.0 (unused), data_len, raw_f32_bytes
+        self.tensor_data.extend_from_slice(&0.0f32.to_le_bytes()); // scale (unused)
+        self.tensor_data.extend_from_slice(&0.0f32.to_le_bytes()); // min (unused)
+
+        let data_bytes = num_values * 4; // 4 bytes per f32
+        self.tensor_data.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+
+        // Write raw f32 values
+        for &v in values {
+            self.tensor_data.extend_from_slice(&v.to_le_bytes());
+        }
+
+        self.tensor_count += 1;
+        Ok(())
+    }
+
+    /// Add a tensor (quantizes to Q4 - 16 levels, 4 bits per value)
+    /// Good balance between size and quality
+    pub fn add_tensor_q4(&mut self, name: &str, values: &[f32]) -> Result<()> {
         let num_values = values.len();
         let num_blocks = (num_values + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -830,28 +871,52 @@ impl OomWriter {
         let name_bytes = name.as_bytes();
         self.tensor_data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
         self.tensor_data.extend_from_slice(name_bytes);
-        self.tensor_data.push(32); // F32 marker
+        self.tensor_data.push(4); // Q4
         self.tensor_data.extend_from_slice(&(num_blocks as u32).to_le_bytes());
         self.tensor_data.extend_from_slice(&(num_values as u32).to_le_bytes());
 
-        // Write blocks (same format as Q4/Q8 but with raw F32 data)
+        // Write blocks
         for block_idx in 0..num_blocks {
             let start = block_idx * BLOCK_SIZE;
             let end = (start + BLOCK_SIZE).min(num_values);
             let block_values = &values[start..end];
 
-            // Write block header (scale and min are unused for F32, but kept for format compatibility)
-            self.tensor_data.extend_from_slice(&(0.0f32).to_le_bytes()); // scale (unused)
-            self.tensor_data.extend_from_slice(&(0.0f32).to_le_bytes()); // min (unused)
-
-            // Data length is num_values * 4 bytes
-            let data_len = block_values.len() * 4;
-            self.tensor_data.extend_from_slice(&(data_len as u32).to_le_bytes());
-
-            // Write raw F32 values
+            // Find min/max
+            let mut min = f32::MAX;
+            let mut max = f32::MIN;
             for &v in block_values {
-                self.tensor_data.extend_from_slice(&v.to_le_bytes());
+                if v < min { min = v; }
+                if v > max { max = v; }
             }
+
+            let range = max - min;
+            let scale = if range.abs() < 1e-9 { 0.0 } else { range / 15.0 };
+
+            // Quantize to Q4 (4 bits per value, 2 values per byte)
+            let mut qdata = Vec::with_capacity((block_values.len() + 1) / 2);
+            let mut current_byte: u8 = 0;
+            let mut shift = 0;
+
+            for &v in block_values {
+                let q = if scale == 0.0 { 0 } else {
+                    let norm = (v - min) / scale;
+                    (norm.round() as u8).min(15)
+                };
+                current_byte |= q << shift;
+                shift += 4;
+                if shift == 8 {
+                    qdata.push(current_byte);
+                    current_byte = 0;
+                    shift = 0;
+                }
+            }
+            if shift > 0 { qdata.push(current_byte); }
+
+            // Write block: scale (f32) + min (f32) + data_len (u32) + qdata
+            self.tensor_data.extend_from_slice(&scale.to_le_bytes());
+            self.tensor_data.extend_from_slice(&min.to_le_bytes());
+            self.tensor_data.extend_from_slice(&(qdata.len() as u32).to_le_bytes());
+            self.tensor_data.extend_from_slice(&qdata);
         }
 
         self.tensor_count += 1;
@@ -914,45 +979,35 @@ fn map_tensor_name(gguf_name: &str) -> String {
     gguf_name.to_string()
 }
 
-/// Convert GGUF to OOM
-pub fn convert_gguf_to_oom<P: AsRef<Path>, Q: AsRef<Path>>(
+/// Quantization level for OOM output
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OomQuantLevel {
+    Q2, // 4 levels - smallest but low quality
+    Q4, // 16 levels - good balance
+    Q8, // 256 levels - highest quality
+}
+
+impl Default for OomQuantLevel {
+    fn default() -> Self { Self::Q8 }
+}
+
+/// Convert GGUF to OOM with configurable quantization
+pub fn convert_gguf_to_oom_with_quant<P: AsRef<Path>, Q: AsRef<Path>>(
     input_path: P,
     output_path: Q,
+    quant_level: OomQuantLevel,
     progress_callback: Option<Box<dyn Fn(usize, usize, &str)>>,
 ) -> Result<()> {
     let reader = GgufReader::open(&input_path)?;
     let mut writer = OomWriter::create(&output_path)?;
 
     let total_tensors = reader.tensors.len();
-    println!("\n🔄 Converting {} tensors to OOM Q8 format (8 bits = 256 levels)...", total_tensors);
-
-    // First pass: check if embed_tokens needs to be replaced by lm_head (tied embeddings fallback)
-    let mut embed_tokens_data: Option<Vec<f32>> = None;
-    let mut lm_head_data: Option<Vec<f32>> = None;
-    let mut use_lm_head_for_embeddings = false;
-
-    // Debug: print first 3 tensor names to verify
-    let first_names: Vec<&str> = reader.tensors.iter().take(3).map(|t| t.name.as_str()).collect();
-    println!("\n   🔍 First 3 GGUF tensor names: {:?}\n", first_names);
-
-    for tensor_info in reader.tensors.iter() {
-        if tensor_info.name == "token_embd.weight" {
-            println!("   🔍 Found token_embd.weight, checking values...");
-            let data = reader.dequantize_tensor(tensor_info)?;
-            let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            let min_val = data.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            println!("   📊 token_embd: max_abs={:.6}, min={:.6}, max={:.6}", max_abs, min_val, max_val);
-            if max_abs < 0.001 {
-                println!("   ⚠️ token_embd.weight has tiny values - will use output.weight");
-                use_lm_head_for_embeddings = true;
-            }
-            embed_tokens_data = Some(data);
-        } else if tensor_info.name == "output.weight" {
-            println!("   🔍 Found output.weight, caching...");
-            lm_head_data = Some(reader.dequantize_tensor(tensor_info)?);
-        }
-    }
+    let quant_name = match quant_level {
+        OomQuantLevel::Q2 => "Q2 (4 levels)",
+        OomQuantLevel::Q4 => "Q4 (16 levels)",
+        OomQuantLevel::Q8 => "Q8 (256 levels)",
+    };
+    println!("\n🔄 Converting {} tensors to OOM {} format...", total_tensors, quant_name);
 
     for (idx, tensor_info) in reader.tensors.iter().enumerate() {
         // Map GGUF tensor name to HuggingFace/Candle format
@@ -965,35 +1020,29 @@ pub fn convert_gguf_to_oom<P: AsRef<Path>, Q: AsRef<Path>>(
             std::io::stdout().flush()?;
         }
 
-        // Skip non-weight tensors (like position embeddings that should stay FP32)
-        // For now, convert everything
+        // Dequantize to FP32
+        let fp32_values = reader.dequantize_tensor(tensor_info)?;
 
-        // Dequantize to FP32 (or use cached data for embed/lm_head)
-        let fp32_values = if tensor_info.name == "token_embd.weight" {
-            if use_lm_head_for_embeddings {
-                // Use lm_head weights for embeddings (tied embeddings fallback)
-                println!("   🔄 Using output.weight for model.embed_tokens.weight (tied embeddings)");
-                lm_head_data.clone().unwrap_or_else(|| reader.dequantize_tensor(tensor_info).unwrap())
-            } else {
-                embed_tokens_data.clone().unwrap_or_else(|| reader.dequantize_tensor(tensor_info).unwrap())
-            }
-        } else if tensor_info.name == "output.weight" {
-            lm_head_data.clone().unwrap_or_else(|| reader.dequantize_tensor(tensor_info).unwrap())
+        // Check if this tensor should be preserved as F32 (no quantization)
+        // F32 is critical for norm weights - they have large dynamic range (e.g., -0.01 to 16.75)
+        // and quantizing them causes massive precision loss
+        // Also preserve BIASES: they are small vectors but require high precision!
+        let is_norm_weight = mapped_name.contains("norm");
+        let is_bias = mapped_name.ends_with(".bias");
+        let is_already_f32 = tensor_info.dtype == GgmlType::F32;
+
+        if is_norm_weight || is_bias || is_already_f32 {
+            // Preserve as F32 for full precision
+            // println!("   Invoking F32 preservation for: {}", mapped_name);
+            writer.add_tensor_f32(&mapped_name, &fp32_values)?;
         } else {
-            reader.dequantize_tensor(tensor_info)?
-        };
-
-        // Debug: check for extreme values that suggest dequant issues
-        if mapped_name.contains("v_proj") || mapped_name.contains("attn_v") {
-            let min_val = fp32_values.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_val = fp32_values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            println!("   ⚠️ {} (type {:?}): min={:.4}, max={:.4}",
-                     &tensor_info.name, tensor_info.dtype, min_val, max_val);
+            // Requantize with selected level
+            match quant_level {
+                OomQuantLevel::Q2 => writer.add_tensor_q2(&mapped_name, &fp32_values)?,
+                OomQuantLevel::Q4 => writer.add_tensor_q4(&mapped_name, &fp32_values)?,
+                OomQuantLevel::Q8 => writer.add_tensor_q8(&mapped_name, &fp32_values)?,
+            }
         }
-
-        // Use Q8 quantization for best quality with reasonable compression
-        // Q8 = 8 bits per value, ~4x smaller than F32
-        writer.add_tensor_q8(&mapped_name, &fp32_values)?;
     }
 
     println!("\n✅ Writing OOM file...");
@@ -1006,10 +1055,19 @@ pub fn convert_gguf_to_oom<P: AsRef<Path>, Q: AsRef<Path>>(
 
     println!("\n📊 Conversion complete!");
     println!("   Input:  {:.2} GB (GGUF)", input_size as f64 / 1e9);
-    println!("   Output: {:.2} GB (OOM Q8)", output_size as f64 / 1e9);
+    println!("   Output: {:.2} GB (OOM {})", output_size as f64 / 1e9, quant_name);
     println!("   Ratio:  {:.1}x smaller", ratio);
 
     Ok(())
+}
+
+/// Convert GGUF to OOM (Q8 by default for best quality)
+pub fn convert_gguf_to_oom<P: AsRef<Path>, Q: AsRef<Path>>(
+    input_path: P,
+    output_path: Q,
+    progress_callback: Option<Box<dyn Fn(usize, usize, &str)>>,
+) -> Result<()> {
+    convert_gguf_to_oom_with_quant(input_path, output_path, OomQuantLevel::Q8, progress_callback)
 }
 
 #[cfg(test)]

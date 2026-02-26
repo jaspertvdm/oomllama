@@ -58,6 +58,8 @@ pub mod oomllama;
 pub mod oomllama_turbo;
 pub mod quant;
 pub mod gguf2oom;
+pub mod safetensors2oom;
+pub mod multi_gpu;
 
 pub use types::IDD;
 pub use intent::{Intent, Action, IntentVerification};
@@ -94,11 +96,9 @@ pub use vector::{VectorRecord, VectorMeta};
 pub use kernel::{SovereignKernel, SovereignIdentity, NeuralCoreInfo};
 pub use embedding::EmbeddingEngine;
 pub use oomllama::OomLlama;
-pub use oomllama_turbo::{
-    TurboEngine, TurboConfig, ModelKVCache, LayerPin, PinStrategy,
-    FlashAttentionConfig, flash_attention_forward,
-    compute_rope_freqs, apply_rope,
-};
+pub use oomllama_turbo::{TurboEngine, TurboConfig, ModelKVCache, LayerPin, PinStrategy};
+pub use multi_gpu::{MultiGPUConfig, MultiGPUManager, LayerStrategy};
+pub use gguf2oom::{OomQuantLevel, convert_gguf_to_oom, convert_gguf_to_oom_with_quant};
 
 
 /// JIS Router version

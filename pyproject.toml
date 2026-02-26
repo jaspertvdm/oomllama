@@ -1,23 +1,21 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "oomllama"
-version = "0.6.0"
+version = "0.7.0"
 description = "Efficient LLM inference with .oom format - 2x smaller than GGUF"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
 authors = [
     { name = "Humotica AI Lab", email = "ai@humotica.nl" },
-    { name = "Jasper van de Meent", email = "jasper@humotica.com" },
+    { name = "Jasper van de Meent", email = "jasper@humotica.nl" },
 ]
 maintainers = [
     { name = "Root AI (Claude)", email = "root_idd@humotica.nl" },
-]
-dependencies = [
-    "requests>=2.25.0",
+    { name = "Gemini IDD", email = "gemini@humotica.nl" },
 ]
 keywords = [
     "llm",
@@ -28,7 +26,6 @@ keywords = [
     "oomllama",
     "humotica",
     "llama",
-    "qwen",
     "ai",
     "machine-learning",
 ]
@@ -49,28 +46,42 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://humotica.com"
-Repository = "https://github.com/jaspertvdm/oomllama"
-Documentation = "https://humotica.com/docs/oomllama"
-"Bug Tracker" = "https://github.com/jaspertvdm/oomllama/issues"
+Homepage = "https://humotica.nl"
+Repository = "https://github.com/humotica/oomllama"
+Documentation = "https://humotica.nl/docs/oomllama"
+"Bug Tracker" = "https://github.com/humotica/oomllama/issues"
 "HuggingFace Models" = "https://huggingface.co/jaspervandemeent"
-"CUDA Wheel" = "https://brein.jaspervandemeent.nl/downloads/"
 
 [project.optional-dependencies]
 dev = ["pytest", "black", "mypy"]
+cuda = ["cupy-cuda12x"]
 
 [project.scripts]
 oomllama = "oomllama:cli"
 
-[tool.hatch.build.targets.wheel]
-packages = ["python/oomllama"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "python/oomllama/**",
-    "README.md",
-    "LICENSE",
+[tool.maturin]
+features = ["python", "pyo3/extension-module"]
+python-source = "python"
+module-name = "oomllama._oomllama"
+strip = true
+exclude = [
+    "data/**",
+    "plans/**",
+    "downloads/**",
+    "static/**",
+    "bin/**",
+    "Cargo.lock",
+    "target/**",
+    ".venv/**",
+    "BETTI*.md",
+    "KMBIT*.md",
+    "TASKS*.md",
+    "OOMLLAMA*.md",
 ]
 
 [tool.black]
 line-length = 100
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
